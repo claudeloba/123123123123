@@ -97,7 +97,7 @@ jobs:
                 --fork-block-number "$BLOCK" \
                 --match-path test/foundry/InvalidOrderTypeNativeOfferPoC.t.sol \
                 -vvvv
-            ) > ../output/forge-test.log 2>&1
+            ) > output/forge-test.log 2>&1
             RC=$?
             set -e
 
