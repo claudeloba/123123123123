@@ -1,0 +1,40 @@
+name: Export exact Seaport 1.6 source
+
+on:
+  push:
+    branches:
+      - research/seaport-breakthrough-20260907
+    paths:
+      - research/EXPORT_SEAPORT_SOURCE
+      - .github/workflows/export-seaport-source.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone exact source and submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/ProjectOpenSea/seaport-1.6.git seaport-1.6
+          git -C seaport-1.6 checkout 4240dc6b30fa73f4b6b437fb588ebe583e796e3a
+          git -C seaport-1.6 submodule update --init --recursive
+          git -C seaport-1.6 rev-parse HEAD > seaport-1.6/EXACT_COMMIT.txt
+          git -C seaport-1.6 submodule status > seaport-1.6/EXACT_SUBMODULES.txt
+          rm -rf seaport-1.6/.git
+          find seaport-1.6 -type d -name .git -prune -exec rm -rf {} + || true
+          tar -czf seaport-1.6-exact.tar.gz seaport-1.6
+          sha256sum seaport-1.6-exact.tar.gz > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seaport-1.6-exact-source-${{ github.run_id }}
+          path: |
+            seaport-1.6-exact.tar.gz
+            SHA256SUMS.txt
+          if-no-files-found: error
