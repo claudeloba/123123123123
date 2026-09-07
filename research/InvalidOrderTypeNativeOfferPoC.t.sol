@@ -153,3 +153,5 @@ contract InvalidOrderTypeNativeOfferPoC is Test {
         assertEq(SEAPORT.balance, 1 ether, "failed control changed protocol balance");
     }
 }
+
+// Triggered after registering the runner on the default branch.
