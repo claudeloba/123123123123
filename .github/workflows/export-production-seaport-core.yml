@@ -1,0 +1,100 @@
+name: Export and verify production Seaport 1.6 source
+
+on:
+  push:
+    branches:
+      - research/seaport-breakthrough-20260907
+    paths:
+      - .github/workflows/export-production-seaport-core.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+      - name: Clone exact production source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          git clone https://github.com/ProjectOpenSea/seaport-core.git production
+          git -C production checkout 523097f9cee66c15d308c900c50f336b291cda08
+          git -C production submodule update --init --recursive
+          git clone --depth 1 https://github.com/foundry-rs/forge-std production/lib/forge-std
+          {
+            echo "commit=$(git -C production rev-parse HEAD)"
+            echo "tree=$(git -C production rev-parse HEAD^{tree})"
+            echo "seaport_types=$(git -C production/lib/seaport-types rev-parse HEAD)"
+            echo "forge=$(forge --version | head -1)"
+          } | tee output/source-anchor.txt
+      - name: Add exact-runtime verification test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p production/test
+          cat > production/test/RuntimeHash.t.sol <<'EOF'
+          // SPDX-License-Identifier: MIT
+          pragma solidity ^0.8.24;
+          import { Test } from "forge-std/Test.sol";
+          import { Seaport } from "../src/Seaport.sol";
+          contract RuntimeHashTest is Test {
+              address constant CONTROLLER = 0x00000000F9490004C11Cef243f5400493c00Ad63;
+              bytes32 constant EXPECTED = 0x74499ac0cce14428e4b41541d5e44f28f5a6882a1051d0118867c2a93cd5aec0;
+              function testProductionRuntimeMatchesLiveDeployment() public {
+                  Seaport deployed = new Seaport(CONTROLLER);
+                  emit log_named_address("local_deployment", address(deployed));
+                  emit log_named_bytes32("local_runtime_codehash", address(deployed).codehash);
+                  emit log_named_uint("local_runtime_codesize", address(deployed).code.length);
+                  assertEq(address(deployed).codehash, EXPECTED);
+                  assertEq(address(deployed).code.length, 23981);
+              }
+          }
+          EOF
+      - name: Build and verify on pinned Ethereum fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          RPC=""
+          BLOCK=""
+          for CANDIDATE in https://ethereum-rpc.publicnode.com https://rpc.flashbots.net https://eth.llamarpc.com https://eth.drpc.org; do
+            LATEST=$(timeout 20s cast block-number --rpc-url "$CANDIDATE" 2>/dev/null || true)
+            CHAIN=$(timeout 20s cast chain-id --rpc-url "$CANDIDATE" 2>/dev/null || true)
+            if [ "$CHAIN" = "1" ] && [[ "$LATEST" =~ ^[0-9]+$ ]]; then
+              RPC="$CANDIDATE"
+              BLOCK=$((LATEST - 64))
+              break
+            fi
+          done
+          test -n "$RPC"
+          (cd production && forge test --fork-url "$RPC" --fork-block-number "$BLOCK" --match-path test/RuntimeHash.t.sol -vvvv) 2>&1 | tee output/runtime-test.log
+          {
+            echo "rpc=$RPC"
+            echo "fork_block=$BLOCK"
+            echo "live_codehash=$(code=$(cast code 0x0000000000000068F116a894984e2DB1123eB395 --block "$BLOCK" --rpc-url "$RPC"); cast keccak "$code")"
+          } | tee output/live-anchor.txt
+          grep -q 'local_runtime_codehash: 0x74499ac0cce14428e4b41541d5e44f28f5a6882a1051d0118867c2a93cd5aec0' output/runtime-test.log
+          grep -q '1 passed; 0 failed' output/runtime-test.log
+          echo PRODUCTION_SOURCE_RUNTIME_EXACT_MATCH | tee output/VERDICT.txt
+      - name: Package exact source and evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf production/.git production/lib/forge-std/.git production/test/RuntimeHash.t.sol
+          find production -type d -name .git -prune -exec rm -rf {} + || true
+          tar -czf output/seaport-core-production-523097f.tar.gz production
+          sha256sum output/* > output/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-seaport-core-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
