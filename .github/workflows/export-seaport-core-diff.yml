@@ -1,0 +1,49 @@
+name: Export Seaport exact versus core differential
+
+on:
+  push:
+    branches:
+      - research/seaport-breakthrough-20260907
+    paths:
+      - .github/workflows/export-seaport-core-diff.yml
+      - research/TRIGGER_CORE_DIFF
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone snapshots and produce structural diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          git clone https://github.com/ProjectOpenSea/seaport-1.6.git exact
+          git -C exact checkout 4240dc6b30fa73f4b6b437fb588ebe583e796e3a
+          git clone https://github.com/ProjectOpenSea/seaport-core.git current
+          CURRENT=$(git -C current rev-parse HEAD)
+          {
+            echo exact_commit=$(git -C exact rev-parse HEAD)
+            echo exact_tree=$(git -C exact rev-parse HEAD^{tree})
+            echo current_commit=$CURRENT
+            echo current_tree=$(git -C current rev-parse HEAD^{tree})
+            echo current_subject=$(git -C current log -1 --format=%s)
+            echo current_date=$(git -C current log -1 --format=%cI)
+          } | tee output/anchors.txt
+          diff -ruN exact/src/core current/src > output/core.diff || true
+          git -C current log --all --date=iso-strict --pretty=format:'%H %ad %s' > output/current-history.txt
+          git -C current log --all -p -G 'ItemType|OrderType|enum|validate.*type|InvalidItemType' -- src > output/enum-history.patch || true
+          rg -n -i 'invaliditemtype|invalidordertype|enum|itemtype|ordertype|TODO|FIXME|audit|security' current/src > output/current-enum-index.txt || true
+          rg -n -i 'invaliditemtype|invalidordertype|enum|itemtype|ordertype|TODO|FIXME|audit|security' exact/src/core > output/exact-enum-index.txt || true
+          tar -czf output/current-seaport-core.tar.gz current/src current/foundry.toml current/package.json
+          sha256sum output/* > output/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seaport-core-diff-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
