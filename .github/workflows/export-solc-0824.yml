@@ -1,0 +1,54 @@
+name: Export solc 0.8.24
+
+on:
+  push:
+    branches:
+      - research/seaport-breakthrough-20260907
+    paths:
+      - .github/workflows/export-solc-0824.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+      - name: Install and package compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p mini/src mini/test mini-out
+          cat > mini/foundry.toml <<'EOF'
+          [profile.default]
+          src = 'src'
+          test = 'test'
+          out = 'out'
+          solc = '0.8.24'
+          evm_version = 'cancun'
+          EOF
+          cat > mini/src/Probe.sol <<'EOF'
+          // SPDX-License-Identifier: MIT
+          pragma solidity ^0.8.24;
+          contract Probe { function x() external pure returns (uint256) { return 1; } }
+          EOF
+          (cd mini && forge build)
+          SOLC=$(find "$HOME/.svm" -type f -name 'solc-0.8.24' | head -1)
+          test -x "$SOLC"
+          cp "$SOLC" ./solc-0.8.24
+          ./solc-0.8.24 --version > SOLC_VERSION.txt
+          sha256sum solc-0.8.24 > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: solc-0.8.24-${{ github.run_id }}
+          path: |
+            solc-0.8.24
+            SOLC_VERSION.txt
+            SHA256SUMS.txt
+          if-no-files-found: error
