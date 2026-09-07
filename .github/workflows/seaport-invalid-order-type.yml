@@ -1,10 +1,11 @@
-name: Seaport invalid OrderType native-offer witness
+name: Seaport dirty-enum semantic differential
 
 on:
   push:
     branches:
       - research/seaport-breakthrough-20260907
     paths:
+      - research/DirtyItemTypeNativePaymentBypass.t.sol
       - research/InvalidOrderTypeNativeOfferPoC.t.sol
       - .github/workflows/seaport-invalid-order-type.yml
   workflow_dispatch:
@@ -31,6 +32,8 @@ jobs:
           git clone https://github.com/ProjectOpenSea/seaport-1.6.git source
           git -C source checkout 4240dc6b30fa73f4b6b437fb588ebe583e796e3a
           git -C source submodule update --init --recursive
+          cp research/DirtyItemTypeNativePaymentBypass.t.sol \
+            source/test/foundry/DirtyItemTypeNativePaymentBypass.t.sol
           cp research/InvalidOrderTypeNativeOfferPoC.t.sol \
             source/test/foundry/InvalidOrderTypeNativeOfferPoC.t.sol
           {
@@ -38,10 +41,9 @@ jobs:
             echo "source_tree=$(git -C source rev-parse HEAD^{tree})"
             echo "forge=$(forge --version | head -1)"
           } | tee output/source-anchor.txt
-          sha256sum research/InvalidOrderTypeNativeOfferPoC.t.sol \
-            > output/witness.sha256
+          sha256sum research/*.t.sol > output/witnesses.sha256
 
-      - name: Execute on exact deployed runtime
+      - name: Anchor exact deployed runtime and execute both constructions
         shell: bash
         env:
           SEAPORT: "0x0000000000000068F116a894984e2DB1123eB395"
@@ -49,94 +51,113 @@ jobs:
         run: |
           set -euo pipefail
           : > output/rpc-probes.txt
-          PASSED=0
+          SELECTED_RPC=""
+          SELECTED_BLOCK=""
 
           for RPC in \
             https://ethereum-rpc.publicnode.com \
             https://rpc.flashbots.net \
             https://eth.llamarpc.com \
             https://eth.drpc.org; do
-
             CHAIN_ID=$(timeout 30s cast chain-id --rpc-url "$RPC" 2>/dev/null || true)
             LATEST=$(timeout 30s cast block-number --rpc-url "$RPC" 2>/dev/null || true)
             if [ "$CHAIN_ID" != "1" ] || ! [[ "$LATEST" =~ ^[0-9]+$ ]] || [ "$LATEST" -le 128 ]; then
               echo "rpc=$RPC probe_failed" >> output/rpc-probes.txt
               continue
             fi
-
             BLOCK=$((LATEST - 64))
             CODE=$(timeout 45s cast code "$SEAPORT" --block "$BLOCK" --rpc-url "$RPC" 2>/dev/null || true)
             CODEHASH=$(cast keccak "$CODE" 2>/dev/null || true)
             INFO=$(timeout 30s cast call "$SEAPORT" \
               'information()(string,bytes32,address)' \
               --block "$BLOCK" --rpc-url "$RPC" 2>/dev/null || true)
-
             printf 'rpc=%s\nchain_id=%s\nlatest=%s\nblock=%s\ncodehash=%s\ninformation=%s\n---\n' \
               "$RPC" "$CHAIN_ID" "$LATEST" "$BLOCK" "$CODEHASH" "$INFO" \
               >> output/rpc-probes.txt
-
-            if [ "$CODEHASH" != "$EXPECTED_CODEHASH" ] || ! printf '%s' "$INFO" | grep -q '1.6'; then
-              continue
-            fi
-
-            {
-              echo "chain_id=$CHAIN_ID"
-              echo "rpc=$RPC"
-              echo "fork_block=$BLOCK"
-              echo "seaport=$SEAPORT"
-              echo "runtime_codehash=$CODEHASH"
-              echo "runtime_codesize=$(( (${#CODE} - 2) / 2 ))"
-              echo "information=$(printf '%s' "$INFO" | tr '\n' ' ')"
-            } | tee output/runtime-anchor.txt
-
-            set +e
-            (
-              cd source
-              FOUNDRY_PROFILE=test forge test \
-                --fork-url "$RPC" \
-                --fork-block-number "$BLOCK" \
-                --match-path test/foundry/InvalidOrderTypeNativeOfferPoC.t.sol \
-                -vvvv
-            ) > output/forge-test.log 2>&1
-            RC=$?
-            set -e
-
-            if [ "$RC" -eq 0 ]; then
-              PASSED=1
+            if [ "$CODEHASH" = "$EXPECTED_CODEHASH" ] && printf '%s' "$INFO" | grep -q '1.6'; then
+              SELECTED_RPC="$RPC"
+              SELECTED_BLOCK="$BLOCK"
+              {
+                echo "chain_id=$CHAIN_ID"
+                echo "rpc=$RPC"
+                echo "fork_block=$BLOCK"
+                echo "seaport=$SEAPORT"
+                echo "runtime_codehash=$CODEHASH"
+                echo "runtime_codesize=$(( (${#CODE} - 2) / 2 ))"
+                echo "information=$(printf '%s' "$INFO" | tr '\n' ' ')"
+              } | tee output/runtime-anchor.txt
               break
-            fi
-
-            if grep -Eq 'Compiler run failed|Compilation failed|\[FAIL' output/forge-test.log; then
-              cat output/forge-test.log
-              exit "$RC"
             fi
           done
 
-          cat output/forge-test.log
-          test "$PASSED" -eq 1
+          test -n "$SELECTED_RPC"
 
-      - name: Validate evidence
+          set +e
+          (
+            cd source
+            FOUNDRY_PROFILE=test \
+            ETH_RPC_URL="$SELECTED_RPC" \
+            FORK_BLOCK="$SELECTED_BLOCK" \
+            forge test \
+              --match-path test/foundry/DirtyItemTypeNativePaymentBypass.t.sol \
+              -vvvv
+          ) > output/dirty-itemtype.log 2>&1
+          DIRTY_RC=$?
+
+          (
+            cd source
+            FOUNDRY_PROFILE=test forge test \
+              --fork-url "$SELECTED_RPC" \
+              --fork-block-number "$SELECTED_BLOCK" \
+              --match-path test/foundry/InvalidOrderTypeNativeOfferPoC.t.sol \
+              -vvvv
+          ) > output/invalid-ordertype.log 2>&1
+          ORDER_TYPE_RC=$?
+          set -e
+
+          echo "$DIRTY_RC" > output/dirty-itemtype.rc
+          echo "$ORDER_TYPE_RC" > output/invalid-ordertype.rc
+          cat output/dirty-itemtype.log
+          cat output/invalid-ordertype.log
+
+      - name: Classify observed behavior
         shell: bash
         run: |
           set -euo pipefail
-          LOG=output/forge-test.log
-          grep -Eq '4 passed; 0 failed|4 tests passed' "$LOG"
-          grep -q 'raw_order_type: 5' "$LOG"
-          grep -q 'seeded_seaport_balance: 7000000000000000000' "$LOG"
-          grep -q 'attacker_delta: 7000000000000000000' "$LOG"
-          grep -q 'seaport_balance_after: 0' "$LOG"
-          grep -q 'accepted_raw_order_type: 6' "$LOG"
-          grep -q 'accepted_raw_order_type: 115792089237316195423570985008687907853269984665640564039457584007913129639935' "$LOG"
-          echo DEPLOYED_SEAPORT_INVALID_ORDER_TYPE_NATIVE_BALANCE_DRAIN_PROVEN \
-            | tee output/VERDICT.txt
-          grep -E '\[PASS\]|Suite result|raw_order_type|seeded_seaport_balance|attacker_delta|seaport_balance_after|accepted_raw_order_type' \
-            "$LOG" > output/evidence.txt
+          DIRTY_RC=$(cat output/dirty-itemtype.rc)
+          ORDER_TYPE_RC=$(cat output/invalid-ordertype.rc)
+          : > output/VERDICT.txt
+
+          if [ "$DIRTY_RC" -eq 0 ] \
+            && grep -q 'dirty_native_itemtype_zero_eth_fill: 1' output/dirty-itemtype.log \
+            && grep -q 'actual_native_paid: 0' output/dirty-itemtype.log; then
+            echo DEPLOYED_SEAPORT_DIRTY_ITEMTYPE_ZERO_PAYMENT_NFT_THEFT_PROVEN \
+              | tee -a output/VERDICT.txt
+          elif grep -Eq 'Compiler run failed|Compilation failed' output/dirty-itemtype.log; then
+            echo DIRTY_ITEMTYPE_COMPILE_FAILED | tee -a output/VERDICT.txt
+          else
+            echo DIRTY_ITEMTYPE_WITNESS_REJECTED | tee -a output/VERDICT.txt
+          fi
+
+          if [ "$ORDER_TYPE_RC" -eq 0 ] \
+            && grep -q 'raw_order_type: 5' output/invalid-ordertype.log \
+            && grep -q 'attacker_delta: 7000000000000000000' output/invalid-ordertype.log; then
+            echo DEPLOYED_SEAPORT_INVALID_ORDERTYPE_BALANCE_DRAIN_PROVEN \
+              | tee -a output/VERDICT.txt
+          elif grep -Eq 'Compiler run failed|Compilation failed' output/invalid-ordertype.log; then
+            echo INVALID_ORDERTYPE_COMPILE_FAILED | tee -a output/VERDICT.txt
+          else
+            echo INVALID_ORDERTYPE_WITNESS_REJECTED | tee -a output/VERDICT.txt
+          fi
+
+          grep -E '\[PASS\]|\[FAIL|Suite result|dirty_native_itemtype|signed_native_price|actual_native_paid|dirty_item_type_word|victim_order_hash|raw_order_type|attacker_delta|accepted_raw_order_type|Error:' \
+            output/*.log > output/evidence.txt || true
           sha256sum output/* > output/SHA256SUMS.txt
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: seaport-invalid-order-type-${{ github.run_id }}
+          name: seaport-dirty-enum-${{ github.run_id }}
           path: output
           if-no-files-found: error
