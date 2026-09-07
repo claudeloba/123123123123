@@ -1,0 +1,62 @@
+name: Seaport guard state probe
+
+on:
+  push:
+    branches:
+      - research/seaport-breakthrough-20260907
+    paths:
+      - .github/workflows/seaport-guard-state.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+      - name: Probe deployed storage and activation eth_call
+        shell: bash
+        env:
+          SEAPORT: "0x0000000000000068F116a894984e2DB1123eB395"
+          GUARD_SLOT: "0x929eee14"
+          SUPPORT_SLOT: "0x54778ab1"
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          : > output/probe.txt
+          for RPC in https://ethereum-rpc.publicnode.com https://rpc.flashbots.net https://eth.llamarpc.com https://eth.drpc.org; do
+            CHAIN=$(timeout 20s cast chain-id --rpc-url "$RPC" 2>/dev/null || true)
+            LATEST=$(timeout 20s cast block-number --rpc-url "$RPC" 2>/dev/null || true)
+            if [ "$CHAIN" != "1" ] || ! [[ "$LATEST" =~ ^[0-9]+$ ]]; then
+              continue
+            fi
+            BLOCK=$((LATEST - 64))
+            GUARD=$(timeout 30s cast storage "$SEAPORT" "$GUARD_SLOT" --block "$BLOCK" --rpc-url "$RPC" 2>&1 || true)
+            SUPPORT=$(timeout 30s cast storage "$SEAPORT" "$SUPPORT_SLOT" --block "$BLOCK" --rpc-url "$RPC" 2>&1 || true)
+            ACTIVATE=$(timeout 30s cast call "$SEAPORT" '__activateTstore()' --from 0x000000000000000000000000000000000000BEEF --block "$BLOCK" --rpc-url "$RPC" 2>&1 || true)
+            CODE=$(timeout 30s cast code "$SEAPORT" --block "$BLOCK" --rpc-url "$RPC" 2>/dev/null || true)
+            CODEHASH=$(cast keccak "$CODE" 2>/dev/null || true)
+            {
+              echo "rpc=$RPC"
+              echo "chain=$CHAIN"
+              echo "block=$BLOCK"
+              echo "codehash=$CODEHASH"
+              echo "guard_slot=$GUARD"
+              echo "support_slot=$SUPPORT"
+              echo "activate_eth_call=$ACTIVATE"
+              echo "---"
+            } | tee -a output/probe.txt
+            break
+          done
+          grep -q '^chain=1$' output/probe.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seaport-guard-state-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
