@@ -1,0 +1,36 @@
+name: Export Foundry binaries
+
+on:
+  push:
+    branches:
+      - research/seaport-breakthrough-20260907
+    paths:
+      - .github/workflows/export-foundry-bin.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p foundry-bin
+          cp "$(command -v forge)" "$(command -v cast)" "$(command -v anvil)" "$(command -v chisel)" foundry-bin/
+          tar -czf foundry-v1.8.1-linux-amd64.tar.gz -C foundry-bin .
+          sha256sum foundry-v1.8.1-linux-amd64.tar.gz > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: foundry-v1.8.1-linux-amd64-${{ github.run_id }}
+          path: |
+            foundry-v1.8.1-linux-amd64.tar.gz
+            SHA256SUMS.txt
+          if-no-files-found: error
