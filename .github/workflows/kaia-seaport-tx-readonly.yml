@@ -1,0 +1,78 @@
+name: Read-only Kaia Seaport transaction probe
+
+on:
+  push:
+    branches:
+      - research/kaia-source-export-20260908
+    paths:
+      - .github/workflows/kaia-seaport-tx-readonly.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve public transaction evidence
+        shell: bash
+        env:
+          RPC: "https://archive-en.node.kaia.io"
+          TX: "0x468e79fac2a423a8a5e6755bb8a1081cf5e9b635c5eb0c09a56a542fd7f93f9e"
+          SEAPORT: "0x0000000000000068F116a894984e2DB1123eB395"
+        run: |
+          set -euo pipefail
+          mkdir -p output
+
+          rpc() {
+            local method="$1"
+            local params="$2"
+            curl --fail --silent --show-error \
+              -H 'content-type: application/json' \
+              --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
+              "$RPC"
+          }
+
+          rpc eth_getTransactionByHash "[\"$TX\"]" | jq . > output/transaction.json
+          rpc eth_getTransactionReceipt "[\"$TX\"]" | jq . > output/receipt.json
+
+          FROM=$(jq -r '.result.from' output/transaction.json)
+          TO=$(jq -r '.result.to' output/transaction.json)
+          BLOCK_HEX=$(jq -r '.result.blockNumber' output/transaction.json)
+          SELECTOR=$(jq -r '.result.input[0:10]' output/transaction.json)
+          STATUS=$(jq -r '.result.status' output/receipt.json)
+
+          rpc kaia_getAccount "[\"$FROM\",\"$BLOCK_HEX\"]" | jq . > output/caller-account-at-block.json
+          rpc kaia_getAccount "[\"$FROM\",\"latest\"]" | jq . > output/caller-account-latest.json
+
+          jq --arg seaport "${SEAPORT,,}" \
+            '.result.logs | map(select((.address|ascii_downcase)==$seaport))' \
+            output/receipt.json > output/seaport-logs.json
+
+          {
+            echo "transaction=$TX"
+            echo "from=$FROM"
+            echo "to=$TO"
+            echo "block=$BLOCK_HEX"
+            echo "selector=$SELECTOR"
+            echo "status=$STATUS"
+            echo "seaport_log_count=$(jq length output/seaport-logs.json)"
+            echo "gas_used=$(jq -r '.result.gasUsed' output/receipt.json)"
+          } | tee output/summary.txt
+
+          test "${TO,,}" = "${SEAPORT,,}"
+          test "$STATUS" = "0x1"
+          test "$(jq length output/seaport-logs.json)" -gt 0
+          echo KAIA_MAINNET_SEAPORT_TRANSACTION_CONFIRMED > output/VERDICT.txt
+          sha256sum output/* > output/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kaia-seaport-tx-readonly-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
