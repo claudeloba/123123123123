@@ -1,0 +1,101 @@
+name: Inspect Kaia USDT permit
+
+on:
+  push:
+    branches:
+      - research/kaia-source-export-20260908
+    paths:
+      - .github/workflows/inspect-kaia-usdt-permit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+
+      - name: Inspect production USDT signature surface
+        shell: bash
+        env:
+          RPC: "https://public-en.node.kaia.io"
+          USDT: "0xd077a400968890eacc75cdc901f0356c943e4fdb"
+          OWNER: "0x800d156a98a677e44d565711fb1e64e5de248108"
+          SPENDER: "0x0000000000000068F116a894984e2DB1123eB395"
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          BLOCK=$(cast block-number --rpc-url "$RPC")
+          CODE=$(cast code "$USDT" --block "$BLOCK" --rpc-url "$RPC")
+          printf '%s' "$CODE" > output/usdt-runtime.hex
+          cast keccak "$CODE" > output/usdt-runtime-codehash.txt
+          cast selectors "$CODE" > output/usdt-selectors.txt || true
+
+          {
+            echo "block=$BLOCK"
+            echo "usdt=$USDT"
+            echo "code_bytes=$(((${#CODE}-2)/2))"
+            echo "codehash=$(cat output/usdt-runtime-codehash.txt)"
+          } > output/runtime-anchor.txt
+
+          cast call "$USDT" 'name()(string)' --block "$BLOCK" --rpc-url "$RPC" > output/name.txt
+          cast call "$USDT" 'symbol()(string)' --block "$BLOCK" --rpc-url "$RPC" > output/symbol.txt
+          cast call "$USDT" 'decimals()(uint8)' --block "$BLOCK" --rpc-url "$RPC" > output/decimals.txt
+          cast call "$USDT" 'totalSupply()(uint256)' --block "$BLOCK" --rpc-url "$RPC" > output/total-supply.txt
+          cast call "$USDT" 'DOMAIN_SEPARATOR()(bytes32)' --block "$BLOCK" --rpc-url "$RPC" > output/domain-separator.txt
+          cast call "$USDT" 'nonces(address)(uint256)' "$OWNER" --block "$BLOCK" --rpc-url "$RPC" > output/owner-nonce.txt
+          cast call "$USDT" 'allowance(address,address)(uint256)' "$OWNER" "$SPENDER" --block "$BLOCK" --rpc-url "$RPC" > output/seaport-allowance.txt
+
+          set +e
+          cast call "$USDT" \
+            'permit(address,address,uint256,uint256,uint8,bytes32,bytes32)' \
+            "$OWNER" "$SPENDER" 1 0 27 \
+            0x0000000000000000000000000000000000000000000000000000000000000000 \
+            0x0000000000000000000000000000000000000000000000000000000000000000 \
+            --from 0x000000000000000000000000000000000000BEEF \
+            --block "$BLOCK" --rpc-url "$RPC" \
+            > output/invalid-permit.stdout 2> output/invalid-permit.stderr
+          echo $? > output/invalid-permit.rc
+          set -e
+
+          IMPLEMENTATION_SLOT=0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
+          BEACON_SLOT=0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50
+          cast storage "$USDT" "$IMPLEMENTATION_SLOT" --block "$BLOCK" --rpc-url "$RPC" > output/eip1967-implementation-slot.txt || true
+          cast storage "$USDT" "$BEACON_SLOT" --block "$BLOCK" --rpc-url "$RPC" > output/eip1967-beacon-slot.txt || true
+
+          IMPL_WORD=$(tr -d '\n' < output/eip1967-implementation-slot.txt)
+          IMPL="0x${IMPL_WORD:26}"
+          echo "$IMPL" > output/implementation-address.txt
+          if [ "$IMPL" != "0x0000000000000000000000000000000000000000" ]; then
+            IMPL_CODE=$(cast code "$IMPL" --block "$BLOCK" --rpc-url "$RPC")
+            printf '%s' "$IMPL_CODE" > output/implementation-runtime.hex
+            cast keccak "$IMPL_CODE" > output/implementation-codehash.txt
+            cast selectors "$IMPL_CODE" > output/implementation-selectors.txt || true
+          fi
+
+          {
+            echo "DOMAIN_SEPARATOR=$(cat output/domain-separator.txt)"
+            echo "NONCE=$(cat output/owner-nonce.txt)"
+            echo "ALLOWANCE=$(cat output/seaport-allowance.txt)"
+            echo "PERMIT_SELECTOR=$(cast sig 'permit(address,address,uint256,uint256,uint8,bytes32,bytes32)')"
+            echo "DOMAIN_SELECTOR=$(cast sig 'DOMAIN_SEPARATOR()')"
+            echo "NONCES_SELECTOR=$(cast sig 'nonces(address)')"
+            echo "INVALID_PERMIT_RC=$(cat output/invalid-permit.rc)"
+            echo "IMPLEMENTATION=$IMPL"
+          } | tee output/summary.txt
+
+          grep -Ei 'permit|nonce|domain' output/*selectors.txt > output/signature-selectors.txt || true
+          sha256sum output/* > output/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kaia-usdt-permit-inspection-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
