@@ -1,0 +1,111 @@
+name: Inspect Kaia Seaport witness
+
+on:
+  push:
+    branches:
+      - research/kaia-source-export-20260908
+    paths:
+      - research/INSPECT_KAIA_SEAPORT_WITNESS
+      - .github/workflows/inspect-kaia-seaport-witness.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query read-only mainnet state
+        shell: bash
+        env:
+          TX: "0x468e79fac2a423a8a5e6755bb8a1081cf5e9b635c5eb0c09a56a542fd7f93f9e"
+          SEAPORT: "0x0000000000000068F116a894984e2DB1123eB395"
+          RPC: "https://public-en.node.kaia.io"
+          ARCHIVE_RPC: "https://archive-en.node.kaia.io"
+        run: |
+          set -euo pipefail
+          mkdir -p output
+
+          rpc() {
+            local endpoint="$1"
+            local method="$2"
+            local params="$3"
+            curl --fail-with-body --retry 3 --max-time 60 -sS \
+              -H 'content-type: application/json' \
+              --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
+              "$endpoint"
+          }
+
+          rpc "$RPC" kaia_getTransactionByHash "[\"$TX\"]" > output/transaction.json
+          rpc "$RPC" kaia_getTransactionReceipt "[\"$TX\"]" > output/receipt.json
+
+          BLOCK_HEX=$(jq -r '.result.blockNumber' output/transaction.json)
+          BLOCK_DEC=$((BLOCK_HEX))
+          PREV_DEC=$((BLOCK_DEC - 1))
+          PREV_HEX=$(printf '0x%x' "$PREV_DEC")
+
+          FROM=$(jq -r '.result.from' output/transaction.json)
+          TO=$(jq -r '.result.to' output/transaction.json)
+          INPUT=$(jq -r '.result.input' output/transaction.json)
+
+          EVENT_TOPIC=$(python3 - <<'PY'
+          try:
+              from Crypto.Hash import keccak
+              k = keccak.new(digest_bits=256)
+              k.update(b'OrderFulfilled(bytes32,address,address,address,(uint8,address,uint256,uint256)[],(uint8,address,uint256,uint256,address)[])')
+              print('0x' + k.hexdigest())
+          except Exception:
+              print('')
+          PY
+          )
+
+          OFFERER=$(jq -r --arg seaport "${SEAPORT,,}" '
+            [.result.logs[]
+              | select((.address|ascii_downcase) == $seaport)
+              | select((.topics|length) >= 3)
+              | .topics[2]
+            ][0] // empty
+          ' output/receipt.json)
+          if [ -n "$OFFERER" ]; then
+            OFFERER="0x${OFFERER:26}"
+          fi
+
+          {
+            echo "tx=$TX"
+            echo "block_hex=$BLOCK_HEX"
+            echo "block_dec=$BLOCK_DEC"
+            echo "caller=$FROM"
+            echo "to=$TO"
+            echo "input_selector=${INPUT:0:10}"
+            echo "order_fulfilled_topic=$EVENT_TOPIC"
+            echo "offerer=$OFFERER"
+          } | tee output/summary.txt
+
+          rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$FROM\",\"$BLOCK_HEX\"]" > output/caller-account.json || true
+          rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$OFFERER\",\"$BLOCK_HEX\"]" > output/offerer-account-at-fill.json || true
+          rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$OFFERER\",\"$PREV_HEX\"]" > output/offerer-account-before-fill.json || true
+          rpc "$ARCHIVE_RPC" klay_getAccountKey "[\"$OFFERER\",\"$BLOCK_HEX\"]" > output/offerer-key-at-fill.json || true
+          rpc "$ARCHIVE_RPC" eth_getCode "[\"$OFFERER\",\"$BLOCK_HEX\"]" > output/offerer-code-at-fill.json || true
+          rpc "$ARCHIVE_RPC" eth_getBalance "[\"$OFFERER\",\"$BLOCK_HEX\"]" > output/offerer-native-balance.json || true
+          rpc "$ARCHIVE_RPC" eth_getTransactionCount "[\"$OFFERER\",\"$BLOCK_HEX\"]" > output/offerer-nonce.json || true
+
+          rpc "$ARCHIVE_RPC" debug_traceTransaction "[\"$TX\",{\"tracer\":\"callTracer\",\"timeout\":\"60s\"}]" > output/call-trace.json || true
+          rpc "$ARCHIVE_RPC" debug_traceTransaction "[\"$TX\",{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true},\"timeout\":\"60s\"}]" > output/state-diff.json || true
+
+          jq . output/transaction.json > output/transaction.pretty.json
+          jq . output/receipt.json > output/receipt.pretty.json
+          for f in output/*account*.json output/*key*.json output/*code*.json output/*balance*.json output/*nonce*.json output/*trace*.json output/state-diff.json; do
+            [ -f "$f" ] && jq . "$f" > "$f.pretty" 2>/dev/null || true
+          done
+          sha256sum output/* > output/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kaia-seaport-witness-inspection-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
