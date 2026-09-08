@@ -1,0 +1,88 @@
+name: Read-only Kaia Seaport offerer AccountKey probe
+
+on:
+  push:
+    branches:
+      - research/kaia-source-export-20260908
+    paths:
+      - .github/workflows/kaia-seaport-offerer-keys-readonly.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve AccountKeys of all fulfilled-order offerers
+        shell: bash
+        env:
+          RPC: "https://archive-en.node.kaia.io"
+          TX: "0x468e79fac2a423a8a5e6755bb8a1081cf5e9b635c5eb0c09a56a542fd7f93f9e"
+          SEAPORT: "0x0000000000000068F116a894984e2DB1123eB395"
+          ORDER_FULFILLED_TOPIC: "0x9d9af8e38d66c62e2c12f0225249fd9d721c54b83f48d9352c97c6cacdcb6f31"
+        run: |
+          set -euo pipefail
+          mkdir -p output/accounts
+
+          rpc() {
+            local method="$1"
+            local params="$2"
+            curl --fail --silent --show-error \
+              -H 'content-type: application/json' \
+              --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
+              "$RPC"
+          }
+
+          rpc eth_getTransactionReceipt "[\"$TX\"]" | jq . > output/receipt.json
+          BLOCK=$(jq -r '.result.blockNumber' output/receipt.json)
+
+          jq -r --arg seaport "${SEAPORT,,}" --arg topic "${ORDER_FULFILLED_TOPIC,,}" \
+            '.result.logs[]
+             | select((.address|ascii_downcase)==$seaport)
+             | select((.topics[0]|ascii_downcase)==$topic)
+             | .topics[1]
+             | "0x" + .[26:]' \
+            output/receipt.json | sort -u > output/offerers.txt
+
+          : > output/summary.tsv
+          printf 'offerer\tkey_type_at_block\tkey_type_latest\taccount_type\tcode_size\n' \
+            >> output/summary.tsv
+
+          while read -r OFFERER; do
+            SAFE=${OFFERER,,}
+            AT_BLOCK=$(rpc kaia_getAccount "[\"$OFFERER\",\"$BLOCK\"]")
+            LATEST=$(rpc kaia_getAccount "[\"$OFFERER\",\"latest\"]")
+            CODE=$(rpc eth_getCode "[\"$OFFERER\",\"latest\"]")
+
+            printf '%s\n' "$AT_BLOCK" | jq . > "output/accounts/${SAFE}-at-block.json"
+            printf '%s\n' "$LATEST" | jq . > "output/accounts/${SAFE}-latest.json"
+            printf '%s\n' "$CODE" | jq . > "output/accounts/${SAFE}-code.json"
+
+            KEY_BLOCK=$(printf '%s' "$AT_BLOCK" | jq -r '.result.account.key.keyType // .result.account.key.key.keyType // "null"')
+            KEY_LATEST=$(printf '%s' "$LATEST" | jq -r '.result.account.key.keyType // .result.account.key.key.keyType // "null"')
+            ACC_TYPE=$(printf '%s' "$LATEST" | jq -r '.result.accType // "null"')
+            CODE_HEX=$(printf '%s' "$CODE" | jq -r '.result // "0x"')
+            CODE_SIZE=$(( (${#CODE_HEX} - 2) / 2 ))
+
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$OFFERER" "$KEY_BLOCK" "$KEY_LATEST" "$ACC_TYPE" "$CODE_SIZE" \
+              | tee -a output/summary.tsv
+          done < output/offerers.txt
+
+          echo "block=$BLOCK" > output/anchor.txt
+          echo "unique_offerers=$(wc -l < output/offerers.txt)" >> output/anchor.txt
+          test "$(wc -l < output/offerers.txt)" -gt 0
+          echo KAIA_SEAPORT_OFFERER_KEYS_RESOLVED > output/VERDICT.txt
+          sha256sum output/* output/accounts/* > output/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kaia-seaport-offerer-keys-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
