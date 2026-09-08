@@ -1,0 +1,53 @@
+name: Kaia explicit contract address history
+
+on:
+  push:
+    branches:
+      - research/kaia-source-export-20260908
+    paths:
+      - .github/workflows/kaia-contract-address-history.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trace CreateWithAddress reachability history
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          git clone https://github.com/kaiachain/kaia.git kaia
+          cd kaia
+          git log --all --date=iso --format='%H %ad %s' -- \
+            blockchain/types/tx_internal_data_smart_contract_deploy.go \
+            > ../output/file-history.txt
+          git log --all -S 'ErrInvalidContractAddress' -p -- \
+            blockchain/types/tx_internal_data_smart_contract_deploy.go \
+            > ../output/invalid-address-pickaxe.txt
+          git log --all -S 'CreateWithAddress' -p -- \
+            blockchain/types/tx_internal_data_smart_contract_deploy.go \
+            > ../output/create-with-address-pickaxe.txt
+          git log --all -G 'Recipient.*nil' -p -- \
+            blockchain/types/tx_internal_data_smart_contract_deploy.go \
+            > ../output/recipient-history.txt
+          git log --all --reverse --format='%H' -- \
+            blockchain/types/tx_internal_data_smart_contract_deploy.go \
+            | head -1 > ../output/first-commit.txt
+          FIRST=$(cat ../output/first-commit.txt)
+          git show "$FIRST:blockchain/types/tx_internal_data_smart_contract_deploy.go" \
+            > ../output/first-version.go || true
+          git tag --sort=creatordate --format='%(creatordate:iso) %(objectname) %(refname:short)' \
+            > ../output/tags.txt
+          cd ..
+          sha256sum output/* > output/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kaia-contract-address-history-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
