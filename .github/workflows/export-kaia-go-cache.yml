@@ -1,0 +1,55 @@
+name: Export Kaia Go build environment
+
+on:
+  push:
+    branches:
+      - research/kaia-source-export-20260908
+    paths:
+      - .github/workflows/export-kaia-go-cache.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.3'
+          cache: false
+
+      - name: Prepare exact Kaia package cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/kaiachain/kaia.git kaia
+          git -C kaia checkout 2d175bab08cefa669f8bc73dd5ce0ea26bc12ebd
+          cd kaia
+          go test -count=1 -run '^$' ./blockchain/types/accountkey
+          cd ..
+
+          mkdir -p output
+          GOROOT_PATH=$(go env GOROOT)
+          GOMODCACHE_PATH=$(go env GOMODCACHE)
+          GOCACHE_PATH=$(go env GOCACHE)
+          printf 'go=%s\ngoroot=%s\ngomodcache=%s\ngocache=%s\n' \
+            "$(go version)" "$GOROOT_PATH" "$GOMODCACHE_PATH" "$GOCACHE_PATH" \
+            > output/environment.txt
+
+          tar --zstd -cf output/goroot.tar.zst -C "$GOROOT_PATH" .
+          tar --zstd -cf output/gomodcache.tar.zst -C "$GOMODCACHE_PATH" .
+          tar --zstd -cf output/gocache.tar.zst -C "$GOCACHE_PATH" .
+          sha256sum output/* > output/SHA256SUMS.txt
+          du -h output/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kaia-go-build-env-${{ github.run_id }}
+          path: output
+          compression-level: 0
+          if-no-files-found: error
