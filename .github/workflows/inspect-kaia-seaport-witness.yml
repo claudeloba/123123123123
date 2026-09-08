@@ -19,72 +19,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Query read-only mainnet state
+      - name: Query pinned read-only mainnet state
         shell: bash
         env:
-          TX: "0x468e79fac2a423a8a5e6755bb8a1081cf5e9b635c5eb0c09a56a542fd7f93f9e"
-          SEAPORT: "0x0000000000000068F116a894984e2DB1123eB395"
-          RPC: "https://public-en.node.kaia.io"
+          BLOCK_HEX: "0x9c0e2ed"
           ARCHIVE_RPC: "https://archive-en.node.kaia.io"
         run: |
-          set -euo pipefail
+          set -u
           mkdir -p output/accounts
 
           rpc() {
-            local endpoint="$1"
-            local method="$2"
-            local params="$3"
-            curl --fail-with-body --retry 3 --max-time 60 -sS \
+            local method="$1"
+            local params="$2"
+            curl --retry 4 --max-time 60 -sS \
               -H 'content-type: application/json' \
               --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
-              "$endpoint"
+              "$ARCHIVE_RPC"
           }
 
-          rpc "$RPC" kaia_getTransactionByHash "[\"$TX\"]" > output/transaction.json
-          rpc "$RPC" kaia_getTransactionReceipt "[\"$TX\"]" > output/receipt.json
+          cat > output/offerers.txt <<'EOF'
+          0x6144fc11a29cef4735ce0a5f31ad7aeb674cd836
+          0x9fe9b38d33f453bec557adb312e4d1fd889e2da3
+          0x07113eac6c50b84cc550ab7ee754253ee6f4d3cc
+          0x800d156a98a677e44d565711fb1e64e5de248108
+          0x4a11939502c2aadce1ee8a495e5a85177a3f7301
+          EOF
+          sed -i 's/^[[:space:]]*//' output/offerers.txt
 
-          BLOCK_HEX=$(jq -r '.result.blockNumber' output/transaction.json)
           BLOCK_DEC=$((BLOCK_HEX))
           PREV_HEX=$(printf '0x%x' "$((BLOCK_DEC - 1))")
-          FROM=$(jq -r '.result.from' output/transaction.json)
-          TO=$(jq -r '.result.to' output/transaction.json)
-          INPUT=$(jq -r '.result.input' output/transaction.json)
-
-          jq -r --arg seaport "${SEAPORT,,}" '
-            [.result.logs[]
-              | select((.address|ascii_downcase) == $seaport)
-              | select((.topics|length) >= 3)
-              | "0x" + (.topics[1][26:])
-            ] | unique[]
-          ' output/receipt.json > output/offerers.txt
-
-          {
-            echo "tx=$TX"
-            echo "block_hex=$BLOCK_HEX"
-            echo "block_dec=$BLOCK_DEC"
-            echo "caller=$FROM"
-            echo "to=$TO"
-            echo "input_selector=${INPUT:0:10}"
-            echo "offerers=$(paste -sd, output/offerers.txt)"
-          } | tee output/summary.txt
-
-          rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$FROM\",\"$BLOCK_HEX\"]" > output/caller-account-at-fill.json || true
-          rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$FROM\",\"latest\"]" > output/caller-account-latest.json || true
+          echo "block_hex=$BLOCK_HEX" > output/summary.txt
+          echo "block_dec=$BLOCK_DEC" >> output/summary.txt
 
           while read -r OFFERER; do
             [ -n "$OFFERER" ] || continue
             NAME=${OFFERER,,}
-            rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-account-at-fill.json" || true
-            rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$OFFERER\",\"$PREV_HEX\"]" > "output/accounts/${NAME}-account-before-fill.json" || true
-            rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-account-latest.json" || true
-            rpc "$ARCHIVE_RPC" klay_getAccountKey "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-key-at-fill.json" || true
-            rpc "$ARCHIVE_RPC" klay_getAccountKey "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-key-latest.json" || true
-            rpc "$ARCHIVE_RPC" eth_getCode "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-code-at-fill.json" || true
-            rpc "$ARCHIVE_RPC" eth_getCode "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-code-latest.json" || true
-            rpc "$ARCHIVE_RPC" eth_getBalance "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-balance-at-fill.json" || true
-            rpc "$ARCHIVE_RPC" eth_getBalance "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-balance-latest.json" || true
-            rpc "$ARCHIVE_RPC" eth_getTransactionCount "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-nonce-at-fill.json" || true
-            rpc "$ARCHIVE_RPC" eth_getTransactionCount "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-nonce-latest.json" || true
+            rpc kaia_getAccount "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-account-at-fill.json"
+            rpc kaia_getAccount "[\"$OFFERER\",\"$PREV_HEX\"]" > "output/accounts/${NAME}-account-before-fill.json"
+            rpc kaia_getAccount "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-account-latest.json"
+            rpc klay_getAccountKey "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-key-at-fill.json"
+            rpc klay_getAccountKey "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-key-latest.json"
+            rpc eth_getCode "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-code-at-fill.json"
+            rpc eth_getCode "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-code-latest.json"
+            rpc eth_getBalance "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-balance-at-fill.json"
+            rpc eth_getBalance "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-balance-latest.json"
+            rpc eth_getTransactionCount "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-nonce-at-fill.json"
+            rpc eth_getTransactionCount "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-nonce-latest.json"
           done < output/offerers.txt
 
           python3 - <<'PY'
@@ -92,11 +72,14 @@ jobs:
           from pathlib import Path
           rows=[]
           for path in sorted(Path('output/accounts').glob('*-account-at-fill.json')):
-              addr=path.name.split('-account-at-fill.json')[0]
+              addr=path.name.removesuffix('-account-at-fill.json')
               def load(suffix):
                   p=Path('output/accounts')/f'{addr}-{suffix}.json'
-                  try: return json.loads(p.read_text()).get('result')
-                  except Exception: return None
+                  try:
+                      obj=json.loads(p.read_text())
+                      return obj.get('result', {'rpc_error': obj.get('error')})
+                  except Exception as e:
+                      return {'parse_error':str(e)}
               at=load('account-at-fill')
               latest=load('account-latest')
               key=load('key-at-fill')
@@ -117,19 +100,21 @@ jobs:
                   'balance_latest':load('balance-latest'),
               })
           Path('output/offerer-matrix.json').write_text(json.dumps(rows,indent=2))
-          for row in rows:
-              at=row['account_at_fill'] or {}
-              body=at.get('account',{}) if isinstance(at,dict) else {}
-              key=row['key_at_fill'] or {}
-              print(row['address'], 'accType=',at.get('accType') if isinstance(at,dict) else None,
-                    'keyType=',key.get('keyType') if isinstance(key,dict) else None,
-                    'code=',row['code_length_at_fill'], 'nonce=',row['nonce_at_fill'])
+          with Path('output/matrix.txt').open('w') as f:
+              for row in rows:
+                  at=row['account_at_fill'] if isinstance(row['account_at_fill'],dict) else {}
+                  key=row['key_at_fill'] if isinstance(row['key_at_fill'],dict) else {}
+                  line=(f"{row['address']} accType={at.get('accType')} "
+                        f"keyType={key.get('keyType')} code={row['code_length_at_fill']} "
+                        f"nonce={row['nonce_at_fill']}")
+                  print(line)
+                  f.write(line+'\n')
           PY
 
           for f in output/*.json output/accounts/*.json; do
             [ -f "$f" ] && jq . "$f" > "$f.pretty" 2>/dev/null || true
           done
-          sha256sum $(find output -type f -print) > output/SHA256SUMS.txt
+          find output -type f -print0 | sort -z | xargs -0 sha256sum > output/SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         if: always()
