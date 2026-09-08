@@ -1,0 +1,87 @@
+name: OpenSea Conduit channel map
+
+on:
+  push:
+    branches:
+      - research/seaport-conduit-map-20260908
+    paths:
+      - .github/workflows/seaport-conduit-channel-map.yml
+      - research/CONDUIT_MAP_TRIGGER
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+      - name: Enumerate authority graph
+        shell: bash
+        env:
+          CONTROLLER: "0x00000000F9490004C11Cef243f5400493c00Ad63"
+          CONDUIT: "0x1e0049783f008a0085193e00003d00cd54003c71"
+          SEAPORT16: "0x0000000000000068F116a894984e2DB1123eB395"
+        run: |
+          set -euo pipefail
+          mkdir -p output/code
+          RPC=""
+          for candidate in https://ethereum-rpc.publicnode.com https://rpc.flashbots.net https://eth.llamarpc.com https://eth.drpc.org; do
+            chain=$(timeout 20s cast chain-id --rpc-url "$candidate" 2>/dev/null || true)
+            latest=$(timeout 20s cast block-number --rpc-url "$candidate" 2>/dev/null || true)
+            if [ "$chain" = "1" ] && [[ "$latest" =~ ^[0-9]+$ ]] && [ "$latest" -gt 128 ]; then
+              RPC="$candidate"
+              BLOCK=$((latest - 64))
+              break
+            fi
+          done
+          test -n "$RPC"
+
+          owner=$(cast call "$CONTROLLER" 'ownerOf(address)(address)' "$CONDUIT" --block "$BLOCK" --rpc-url "$RPC")
+          key=$(cast call "$CONTROLLER" 'getKey(address)(bytes32)' "$CONDUIT" --block "$BLOCK" --rpc-url "$RPC")
+          count=$(cast call "$CONTROLLER" 'getTotalChannels(address)(uint256)' "$CONDUIT" --block "$BLOCK" --rpc-url "$RPC")
+          count=${count%% *}
+
+          {
+            echo "rpc=$RPC"
+            echo "chain_id=1"
+            echo "block=$BLOCK"
+            echo "controller=$CONTROLLER"
+            echo "conduit=$CONDUIT"
+            echo "owner=$owner"
+            echo "key=$key"
+            echo "channel_count=$count"
+          } | tee output/anchor.txt
+
+          printf 'index\taddress\topen\tcodesize\tcodehash\tis_seaport16\n' | tee output/channels.tsv
+          i=0
+          while [ "$i" -lt "$count" ]; do
+            channel=$(cast call "$CONTROLLER" 'getChannel(address,uint256)(address)' "$CONDUIT" "$i" --block "$BLOCK" --rpc-url "$RPC")
+            open=$(cast call "$CONTROLLER" 'getChannelStatus(address,address)(bool)' "$CONDUIT" "$channel" --block "$BLOCK" --rpc-url "$RPC")
+            code=$(cast code "$channel" --block "$BLOCK" --rpc-url "$RPC")
+            size=$(( (${#code} - 2) / 2 ))
+            codehash=$(cast keccak "$code")
+            is16=0
+            if [ "${channel,,}" = "${SEAPORT16,,}" ]; then is16=1; fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$channel" "$open" "$size" "$codehash" "$is16" | tee -a output/channels.tsv
+            printf '%s\n' "$code" > "output/code/${channel}.hex"
+            i=$((i + 1))
+          done
+
+          conduit_code=$(cast code "$CONDUIT" --block "$BLOCK" --rpc-url "$RPC")
+          {
+            echo "conduit_codesize=$(( (${#conduit_code} - 2) / 2 ))"
+            echo "conduit_codehash=$(cast keccak "$conduit_code")"
+          } | tee output/conduit.txt
+          sha256sum output/anchor.txt output/channels.tsv output/conduit.txt output/code/*.hex > output/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: seaport-conduit-channel-map-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
