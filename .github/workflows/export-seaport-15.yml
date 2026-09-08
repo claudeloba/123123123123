@@ -1,0 +1,43 @@
+name: Export exact Seaport 1.5 source
+
+on:
+  push:
+    branches:
+      - research/seaport-15-channel-20260909
+    paths:
+      - .github/workflows/export-seaport-15.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package exact tagged source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --recurse-submodules https://github.com/ProjectOpenSea/seaport.git seaport-1.5
+          git -C seaport-1.5 checkout ab3b5cb6e10580ea979d63983e409e679935c702
+          git -C seaport-1.5 submodule update --init --recursive
+          {
+            echo commit=$(git -C seaport-1.5 rev-parse HEAD)
+            echo tree=$(git -C seaport-1.5 rev-parse HEAD^{tree})
+            git -C seaport-1.5 submodule status --recursive
+          } > source-anchor.txt
+          rm -rf seaport-1.5/.git
+          find seaport-1.5 -name .git -type f -delete
+          tar -czf seaport-1.5-exact-source.tar.gz seaport-1.5
+          sha256sum seaport-1.5-exact-source.tar.gz source-anchor.txt > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seaport-1.5-exact-source-${{ github.run_id }}
+          path: |
+            seaport-1.5-exact-source.tar.gz
+            source-anchor.txt
+            SHA256SUMS.txt
+          if-no-files-found: error
