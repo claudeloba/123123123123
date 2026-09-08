@@ -1,0 +1,98 @@
+name: Read-only Kaia Seaport conduit probe
+
+on:
+  push:
+    branches:
+      - research/kaia-source-export-20260908
+    paths:
+      - .github/workflows/kaia-seaport-conduit-readonly.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+
+      - name: Query canonical contracts without broadcasting
+        shell: bash
+        env:
+          SEAPORT: "0x0000000000000068F116a894984e2DB1123eB395"
+          CONTROLLER: "0x00000000F9490004C11Cef243f5400493c00Ad63"
+          CONDUIT: "0x1E0049783F008A0085193E00003D00cd54003c71"
+          CONDUIT_KEY: "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000"
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          : > output/probe.txt
+          SUCCESS=0
+
+          for RPC in \
+            https://public-en.node.kaia.io \
+            https://archive-en.node.kaia.io \
+            https://kaia.blockpi.network/v1/rpc/public \
+            https://klaytn.drpc.org; do
+            CHAIN=$(timeout 30s cast chain-id --rpc-url "$RPC" 2>/dev/null || true)
+            BLOCK=$(timeout 30s cast block-number --rpc-url "$RPC" 2>/dev/null || true)
+            if [ "$CHAIN" != "8217" ]; then
+              echo "rpc=$RPC unavailable_or_wrong_chain chain=$CHAIN" >> output/probe.txt
+              continue
+            fi
+
+            SEAPORT_CODE=$(timeout 30s cast code "$SEAPORT" --rpc-url "$RPC")
+            CONTROLLER_CODE=$(timeout 30s cast code "$CONTROLLER" --rpc-url "$RPC")
+            CONDUIT_CODE=$(timeout 30s cast code "$CONDUIT" --rpc-url "$RPC")
+            INFORMATION=$(timeout 30s cast call "$SEAPORT" \
+              'information()(string,bytes32,address)' --rpc-url "$RPC")
+            DERIVED=$(timeout 30s cast call "$CONTROLLER" \
+              'getConduit(bytes32)(address,bool)' "$CONDUIT_KEY" --rpc-url "$RPC")
+            CHANNEL=$(timeout 30s cast call "$CONTROLLER" \
+              'getChannelStatus(address,address)(bool)' "$CONDUIT" "$SEAPORT" --rpc-url "$RPC")
+            KEY=$(timeout 30s cast call "$CONTROLLER" \
+              'getKey(address)(bytes32)' "$CONDUIT" --rpc-url "$RPC")
+            OWNER=$(timeout 30s cast call "$CONTROLLER" \
+              'ownerOf(address)(address)' "$CONDUIT" --rpc-url "$RPC")
+
+            {
+              echo "rpc=$RPC"
+              echo "chain_id=$CHAIN"
+              echo "block=$BLOCK"
+              echo "seaport_code_size=$(( (${#SEAPORT_CODE} - 2) / 2 ))"
+              echo "seaport_code_hash=$(cast keccak "$SEAPORT_CODE")"
+              echo "controller_code_size=$(( (${#CONTROLLER_CODE} - 2) / 2 ))"
+              echo "controller_code_hash=$(cast keccak "$CONTROLLER_CODE")"
+              echo "conduit_code_size=$(( (${#CONDUIT_CODE} - 2) / 2 ))"
+              echo "conduit_code_hash=$(cast keccak "$CONDUIT_CODE")"
+              echo "information=$(printf '%s' "$INFORMATION" | tr '\n' ' ')"
+              echo "getConduit=$(printf '%s' "$DERIVED" | tr '\n' ' ')"
+              echo "seaport_channel_open=$(printf '%s' "$CHANNEL" | tr '\n' ' ')"
+              echo "conduit_key=$(printf '%s' "$KEY" | tr '\n' ' ')"
+              echo "conduit_owner=$(printf '%s' "$OWNER" | tr '\n' ' ')"
+            } | tee -a output/probe.txt
+
+            SUCCESS=1
+            break
+          done
+
+          test "$SUCCESS" -eq 1
+          grep -q '^chain_id=8217$' output/probe.txt
+          grep -q '1.6' output/probe.txt
+          grep -qi '0x1e0049783f008a0085193e00003d00cd54003c71' output/probe.txt
+          grep -qi 'seaport_channel_open=true' output/probe.txt
+          echo KAIA_CANONICAL_SEAPORT_CONDUIT_PATH_CONFIRMED > output/VERDICT.txt
+          sha256sum output/* > output/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kaia-seaport-conduit-readonly-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
