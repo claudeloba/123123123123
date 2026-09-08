@@ -1,0 +1,113 @@
+name: Kaia conduit channel squatting probe
+
+on:
+  push:
+    branches:
+      - research/seaport-15-channel-20260909
+    paths:
+      - .github/workflows/kaia-conduit-channel-squatting.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.4.4
+
+      - name: Inspect canonical Kaia conduit channels
+        shell: bash
+        env:
+          RPC: https://public-en.node.kaia.io
+          CONTROLLER: 0x00000000F9490004C11Cef243f5400493c00Ad63
+          CONDUIT: 0x1e0049783f008a0085193e00003d00cd54003c71
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          BLOCK=$(cast block-number --rpc-url "$RPC")
+          echo "$BLOCK" > output/block.txt
+          cast code "$CONTROLLER" --block "$BLOCK" --rpc-url "$RPC" > output/controller-code.txt
+          cast code "$CONDUIT" --block "$BLOCK" --rpc-url "$RPC" > output/conduit-code.txt
+          cast call "$CONTROLLER" 'getChannels(address)(address[])' "$CONDUIT" \
+            --block "$BLOCK" --rpc-url "$RPC" > output/channels.raw.txt
+
+          python3 - <<'PY'
+          import re, json, subprocess, os
+          from pathlib import Path
+          rpc=os.environ['RPC']
+          raw=Path('output/channels.raw.txt').read_text()
+          channels=[]
+          for a in re.findall(r'0x[0-9a-fA-F]{40}',raw):
+              if a.lower() not in {x.lower() for x in channels}:
+                  channels.append(a)
+          rows=[]
+          for ch in channels:
+              code=subprocess.check_output(['cast','code',ch,'--rpc-url',rpc],text=True).strip()
+              nonce=subprocess.check_output(['cast','nonce',ch,'--rpc-url',rpc],text=True).strip()
+              payload='{"jsonrpc":"2.0","id":1,"method":"kaia_getAccount","params":["%s","latest"]}'%ch
+              account=subprocess.check_output(['curl','-sS','-H','content-type: application/json','--data',payload,rpc],text=True)
+              try: account_json=json.loads(account)
+              except Exception: account_json={'parse_error':account}
+              vacant=(code in ('0x','')) and account_json.get('result') is None
+              rows.append({'channel':ch,'code_bytes':max(0,(len(code)-2)//2),'nonce':nonce,'account':account_json.get('result'),'vacant':vacant})
+          Path('output/channel-matrix.json').write_text(json.dumps(rows,indent=2))
+          Path('output/channels.txt').write_text('\n'.join(channels)+'\n')
+          vacant=[r for r in rows if r['vacant']]
+          Path('output/vacant-channels.json').write_text(json.dumps(vacant,indent=2))
+          print(json.dumps(rows,indent=2))
+          PY
+
+      - name: Prove explicit-address deployment semantics in exact Kaia source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/kaiachain/kaia.git kaia
+          git -C kaia checkout 2d175bab08cefa669f8bc73dd5ce0ea26bc12ebd
+          FILE=kaia/blockchain/types/tx_internal_data_smart_contract_deploy.go
+          grep -n 'Recipient.*\*common.Address' "$FILE" > output/explicit-recipient.txt
+          grep -n 'CreateWithAddress' "$FILE" > output/create-with-address.txt
+          grep -n 'stateDB.Exist(\*t.Recipient)' "$FILE" > output/existence-guard.txt
+          grep -n 'crypto.CreateAddress(t.From, t.AccountNonce)' "$FILE" > output/create-address-branch.txt
+          if grep -q 'CreateWithAddress(sender, t.Payload, gas, value, \*t.Recipient' "$FILE"; then
+            echo EXPLICIT_ADDRESS_DEPLOYMENT_PRESENT > output/source-verdict.txt
+          else
+            echo EXPLICIT_ADDRESS_DEPLOYMENT_NOT_PROVEN > output/source-verdict.txt
+            exit 1
+          fi
+          git -C kaia rev-parse HEAD > output/kaia-commit.txt
+
+      - name: Classify canonical exposure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('output/channel-matrix.json').read_text())
+          vacant=[r for r in rows if r['vacant']]
+          explicit=Path('output/source-verdict.txt').read_text().strip()=='EXPLICIT_ADDRESS_DEPLOYMENT_PRESENT'
+          if vacant and explicit:
+              verdict='CANONICAL_KAIA_CONDUIT_VACANT_CHANNEL_TAKEOVER_CANDIDATE'
+          elif explicit:
+              verdict='EXPLICIT_ADDRESS_DEPLOYMENT_CONFIRMED_BUT_NO_CURRENT_VACANT_CHANNEL'
+          else:
+              verdict='NO_CHANNEL_SQUATTING_CONSTRUCTION'
+          report={'verdict':verdict,'channels':rows,'vacant_channels':vacant,'explicit_address_deployment':explicit}
+          Path('output/report.json').write_text(json.dumps(report,indent=2))
+          Path('output/VERDICT.txt').write_text(verdict+'\n')
+          print(verdict)
+          PY
+          find output -type f -print0 | sort -z | xargs -0 sha256sum > output/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kaia-conduit-channel-squatting-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
