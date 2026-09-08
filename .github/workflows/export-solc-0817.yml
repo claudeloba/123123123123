@@ -1,0 +1,36 @@
+name: Export solc 0.8.17
+
+on:
+  push:
+    branches:
+      - research/seaport-15-channel-20260909
+    paths:
+      - .github/workflows/export-solc-0817.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          curl -L --fail --retry 3 \
+            https://github.com/ethereum/solidity/releases/download/v0.8.17/solc-static-linux \
+            -o output/solc-0.8.17
+          chmod +x output/solc-0.8.17
+          output/solc-0.8.17 --version | tee output/version.txt
+          sha256sum output/solc-0.8.17 output/version.txt > output/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: solc-0.8.17-${{ github.run_id }}
+          path: output
+          compression-level: 0
+          if-no-files-found: error
