@@ -1,0 +1,40 @@
+name: Export exact Kaia source
+
+on:
+  push:
+    branches:
+      - research/kaia-source-export-20260908
+    paths:
+      - research/EXPORT_KAIA_SOURCE
+      - .github/workflows/export-kaia-source.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone and package exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/kaiachain/kaia.git kaia
+          git -C kaia checkout 2d175bab08cefa669f8bc73dd5ce0ea26bc12ebd
+          git -C kaia rev-parse HEAD > kaia/EXACT_COMMIT.txt
+          git -C kaia rev-parse HEAD^{tree} > kaia/EXACT_TREE.txt
+          rm -rf kaia/.git
+          tar -czf kaia-exact-source.tar.gz kaia
+          sha256sum kaia-exact-source.tar.gz > SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kaia-exact-source-${{ github.run_id }}
+          path: |
+            kaia-exact-source.tar.gz
+            SHA256SUMS.txt
+          if-no-files-found: error
