@@ -28,7 +28,7 @@ jobs:
           ARCHIVE_RPC: "https://archive-en.node.kaia.io"
         run: |
           set -euo pipefail
-          mkdir -p output
+          mkdir -p output/accounts
 
           rpc() {
             local endpoint="$1"
@@ -45,23 +45,18 @@ jobs:
 
           BLOCK_HEX=$(jq -r '.result.blockNumber' output/transaction.json)
           BLOCK_DEC=$((BLOCK_HEX))
-          PREV_DEC=$((BLOCK_DEC - 1))
-          PREV_HEX=$(printf '0x%x' "$PREV_DEC")
-
+          PREV_HEX=$(printf '0x%x' "$((BLOCK_DEC - 1))")
           FROM=$(jq -r '.result.from' output/transaction.json)
           TO=$(jq -r '.result.to' output/transaction.json)
           INPUT=$(jq -r '.result.input' output/transaction.json)
 
-          OFFERER=$(jq -r --arg seaport "${SEAPORT,,}" '
+          jq -r --arg seaport "${SEAPORT,,}" '
             [.result.logs[]
               | select((.address|ascii_downcase) == $seaport)
               | select((.topics|length) >= 3)
-              | .topics[2]
-            ][0] // empty
-          ' output/receipt.json)
-          if [ -n "$OFFERER" ]; then
-            OFFERER="0x${OFFERER:26}"
-          fi
+              | "0x" + (.topics[1][26:])
+            ] | unique[]
+          ' output/receipt.json > output/offerers.txt
 
           {
             echo "tx=$TX"
@@ -70,27 +65,75 @@ jobs:
             echo "caller=$FROM"
             echo "to=$TO"
             echo "input_selector=${INPUT:0:10}"
-            echo "offerer=$OFFERER"
+            echo "offerers=$(paste -sd, output/offerers.txt)"
           } | tee output/summary.txt
 
-          rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$FROM\",\"$BLOCK_HEX\"]" > output/caller-account.json || true
-          rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$OFFERER\",\"$BLOCK_HEX\"]" > output/offerer-account-at-fill.json || true
-          rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$OFFERER\",\"$PREV_HEX\"]" > output/offerer-account-before-fill.json || true
-          rpc "$ARCHIVE_RPC" klay_getAccountKey "[\"$OFFERER\",\"$BLOCK_HEX\"]" > output/offerer-key-at-fill.json || true
-          rpc "$ARCHIVE_RPC" eth_getCode "[\"$OFFERER\",\"$BLOCK_HEX\"]" > output/offerer-code-at-fill.json || true
-          rpc "$ARCHIVE_RPC" eth_getBalance "[\"$OFFERER\",\"$BLOCK_HEX\"]" > output/offerer-native-balance.json || true
-          rpc "$ARCHIVE_RPC" eth_getTransactionCount "[\"$OFFERER\",\"$BLOCK_HEX\"]" > output/offerer-nonce.json || true
-          rpc "$ARCHIVE_RPC" debug_traceTransaction "[\"$TX\",{\"tracer\":\"callTracer\",\"timeout\":\"60s\"}]" > output/call-trace.json || true
-          rpc "$ARCHIVE_RPC" debug_traceTransaction "[\"$TX\",{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true},\"timeout\":\"60s\"}]" > output/state-diff.json || true
+          rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$FROM\",\"$BLOCK_HEX\"]" > output/caller-account-at-fill.json || true
+          rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$FROM\",\"latest\"]" > output/caller-account-latest.json || true
 
-          for f in output/*.json; do
-            jq . "$f" > "$f.pretty" 2>/dev/null || true
+          while read -r OFFERER; do
+            [ -n "$OFFERER" ] || continue
+            NAME=${OFFERER,,}
+            rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-account-at-fill.json" || true
+            rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$OFFERER\",\"$PREV_HEX\"]" > "output/accounts/${NAME}-account-before-fill.json" || true
+            rpc "$ARCHIVE_RPC" kaia_getAccount "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-account-latest.json" || true
+            rpc "$ARCHIVE_RPC" klay_getAccountKey "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-key-at-fill.json" || true
+            rpc "$ARCHIVE_RPC" klay_getAccountKey "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-key-latest.json" || true
+            rpc "$ARCHIVE_RPC" eth_getCode "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-code-at-fill.json" || true
+            rpc "$ARCHIVE_RPC" eth_getCode "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-code-latest.json" || true
+            rpc "$ARCHIVE_RPC" eth_getBalance "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-balance-at-fill.json" || true
+            rpc "$ARCHIVE_RPC" eth_getBalance "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-balance-latest.json" || true
+            rpc "$ARCHIVE_RPC" eth_getTransactionCount "[\"$OFFERER\",\"$BLOCK_HEX\"]" > "output/accounts/${NAME}-nonce-at-fill.json" || true
+            rpc "$ARCHIVE_RPC" eth_getTransactionCount "[\"$OFFERER\",\"latest\"]" > "output/accounts/${NAME}-nonce-latest.json" || true
+          done < output/offerers.txt
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows=[]
+          for path in sorted(Path('output/accounts').glob('*-account-at-fill.json')):
+              addr=path.name.split('-account-at-fill.json')[0]
+              def load(suffix):
+                  p=Path('output/accounts')/f'{addr}-{suffix}.json'
+                  try: return json.loads(p.read_text()).get('result')
+                  except Exception: return None
+              at=load('account-at-fill')
+              latest=load('account-latest')
+              key=load('key-at-fill')
+              latest_key=load('key-latest')
+              code=load('code-at-fill')
+              latest_code=load('code-latest')
+              rows.append({
+                  'address':addr,
+                  'account_at_fill':at,
+                  'account_latest':latest,
+                  'key_at_fill':key,
+                  'key_latest':latest_key,
+                  'code_length_at_fill': None if not isinstance(code,str) else max(0,(len(code)-2)//2),
+                  'code_length_latest': None if not isinstance(latest_code,str) else max(0,(len(latest_code)-2)//2),
+                  'nonce_at_fill':load('nonce-at-fill'),
+                  'nonce_latest':load('nonce-latest'),
+                  'balance_at_fill':load('balance-at-fill'),
+                  'balance_latest':load('balance-latest'),
+              })
+          Path('output/offerer-matrix.json').write_text(json.dumps(rows,indent=2))
+          for row in rows:
+              at=row['account_at_fill'] or {}
+              body=at.get('account',{}) if isinstance(at,dict) else {}
+              key=row['key_at_fill'] or {}
+              print(row['address'], 'accType=',at.get('accType') if isinstance(at,dict) else None,
+                    'keyType=',key.get('keyType') if isinstance(key,dict) else None,
+                    'code=',row['code_length_at_fill'], 'nonce=',row['nonce_at_fill'])
+          PY
+
+          for f in output/*.json output/accounts/*.json; do
+            [ -f "$f" ] && jq . "$f" > "$f.pretty" 2>/dev/null || true
           done
-          sha256sum output/* > output/SHA256SUMS.txt
+          sha256sum $(find output -type f -print) > output/SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: kaia-seaport-witness-inspection-${{ github.run_id }}
+          name: kaia-seaport-offerer-inspection-${{ github.run_id }}
           path: output
           if-no-files-found: error
