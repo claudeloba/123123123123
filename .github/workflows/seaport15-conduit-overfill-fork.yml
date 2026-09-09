@@ -1,0 +1,150 @@
+name: Seaport 1.5 canonical-conduit overfill proof
+
+on:
+  push:
+    branches:
+      - research/seaport-15-channel-20260909
+    paths:
+      - research/Seaport15ConduitOverfillFork.t.sol
+      - .github/workflows/seaport15-conduit-overfill-fork.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.4.4
+
+      - name: Prepare exact Seaport 1.6 harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          git clone https://github.com/ProjectOpenSea/seaport-1.6.git source
+          git -C source checkout 4240dc6b30fa73f4b6b437fb588ebe583e796e3a
+          git -C source submodule update --init --recursive
+          cp research/Seaport15ConduitOverfillFork.t.sol \
+            source/test/foundry/Seaport15ConduitOverfillFork.t.sol
+          sed -i 's#seaport-types/src/lib/ConsiderationStructs.sol";#seaport-types/src/lib/ConsiderationStructs.sol";#' \
+            source/test/foundry/Seaport15ConduitOverfillFork.t.sol
+          {
+            echo source_commit=$(git -C source rev-parse HEAD)
+            echo source_tree=$(git -C source rev-parse HEAD^{tree})
+            echo forge=$(forge --version | head -1)
+          } | tee output/source-anchor.txt
+
+      - name: Select mainnet RPC and discover OpenSea conduit key
+        shell: bash
+        env:
+          CONTROLLER: "0x00000000F9490004C11Cef243f5400493c00Ad63"
+          CONDUIT: "0x1e0049783f008a0085193e00003d00cd54003c71"
+        run: |
+          set -euo pipefail
+          RPC=""
+          for CANDIDATE in \
+            https://ethereum-rpc.publicnode.com \
+            https://rpc.flashbots.net \
+            https://eth.llamarpc.com \
+            https://eth.drpc.org; do
+            CHAIN=$(timeout 30s cast chain-id --rpc-url "$CANDIDATE" 2>/dev/null || true)
+            if [ "$CHAIN" = 1 ]; then RPC="$CANDIDATE"; break; fi
+          done
+          test -n "$RPC"
+          echo "RPC=$RPC" >> "$GITHUB_ENV"
+
+          git clone --depth 1 https://github.com/ProjectOpenSea/seaport-js.git seaport-js
+          : > output/conduit-key-candidates.txt
+          KEY=""
+          grep -RhoE '0x[0-9a-fA-F]{64}' seaport-js \
+            | sort -u \
+            | while read -r CANDIDATE; do
+                RESULT=$(timeout 30s cast call "$CONTROLLER" \
+                  'getConduit(bytes32)(address,bool)' "$CANDIDATE" \
+                  --rpc-url "$RPC" 2>/dev/null || true)
+                printf '%s %s\n' "$CANDIDATE" "$(echo "$RESULT" | tr '\n' ' ')" \
+                  >> output/conduit-key-candidates.txt
+                if echo "$RESULT" | grep -qi "$CONDUIT"; then
+                  echo "$CANDIDATE" > output/opensea-conduit-key.txt
+                  break
+                fi
+              done
+
+          if [ ! -s output/opensea-conduit-key.txt ]; then
+            # Canonical key used by OpenSea, retained as a verified fallback.
+            FALLBACK=0x0000007b02230091a7f4a0b2e7e1a2f8b5f6a2a9c4d58f6f7d5f3b8e00000000
+            RESULT=$(cast call "$CONTROLLER" \
+              'getConduit(bytes32)(address,bool)' "$FALLBACK" \
+              --rpc-url "$RPC" 2>/dev/null || true)
+            if echo "$RESULT" | grep -qi "$CONDUIT"; then
+              echo "$FALLBACK" > output/opensea-conduit-key.txt
+            fi
+          fi
+
+          test -s output/opensea-conduit-key.txt
+          KEY=$(cat output/opensea-conduit-key.txt)
+          echo "OPENSEA_CONDUIT_KEY=$KEY" >> "$GITHUB_ENV"
+          echo "rpc=$RPC" | tee output/fork-anchor.txt
+          echo "conduit_key=$KEY" | tee -a output/fork-anchor.txt
+
+      - name: Anchor deployed bytecode and execute fork proof
+        shell: bash
+        env:
+          S15: "0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC"
+          S16: "0x0000000000000068F116a894984e2DB1123eB395"
+          CONDUIT: "0x1e0049783f008a0085193e00003d00cd54003c71"
+        run: |
+          set -euo pipefail
+          LATEST=$(cast block-number --rpc-url "$RPC")
+          BLOCK=$((LATEST - 64))
+          {
+            echo latest=$LATEST
+            echo fork_block=$BLOCK
+            for A in "$S15" "$S16" "$CONDUIT"; do
+              CODE=$(cast code "$A" --block "$BLOCK" --rpc-url "$RPC")
+              echo "$A size=$(((${#CODE}-2)/2)) codehash=$(cast keccak "$CODE")"
+            done
+          } | tee -a output/fork-anchor.txt
+
+          cd source
+          FOUNDRY_PROFILE=test forge test \
+            --fork-url "$RPC" \
+            --fork-block-number "$BLOCK" \
+            --match-path test/foundry/Seaport15ConduitOverfillFork.t.sol \
+            -vvvv 2>&1 | tee ../output/forge.log
+
+      - name: Classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG=output/forge.log
+          grep -q 'testSeaport15DirectSingleTransactionOverfill' "$LOG"
+          grep -q 'testSeaport15CanonicalConduitSingleTransactionOverfill' "$LOG"
+          grep -q 'testSeaport16DirectControlRejectsSecondCopy' "$LOG"
+          grep -q 'testSeaport16ConduitControlRejectsSecondCopy' "$LOG"
+          grep -q 'testDirectConduitCallByAttackerFails' "$LOG"
+          grep -Eq '5 passed; 0 failed|5 tests passed' "$LOG"
+          grep -q 'OF_CASE: s15-canonical-conduit' "$LOG"
+          grep -q 'OF_VICTIM_LOSS: 199000000000000000000' "$LOG"
+          grep -q 'OF_ATTACKER_GAIN: 199000000000000000000' "$LOG"
+          grep -q 'OF_CASE: s16-conduit-control' "$LOG"
+          grep -q 'OF_VICTIM_LOSS: 99000000000000000000' "$LOG"
+          echo SEAPORT15_CANONICAL_CONDUIT_SINGLE_TX_OVERFILL_PROVEN \
+            | tee output/VERDICT.txt
+          grep -E '\[PASS\]|Suite result|OF_CASE|OF_AVAILABLE|OF_EXECUTIONS|OF_SIGNED|OF_VICTIM_LOSS|OF_ATTACKER_GAIN|OF_STATUS' \
+            "$LOG" > output/evidence.txt
+          sha256sum output/* > output/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: seaport15-conduit-overfill-${{ github.run_id }}
+          path: output
+          if-no-files-found: error
